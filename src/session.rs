@@ -51,6 +51,13 @@ pub struct State {
     log: Option<File>,
 }
 
+impl State {
+    /// Where the agent's reading position really is: a redraw may have erased lines it already read.
+    fn read_pos(&self) -> usize {
+        self.cursor.min(self.text.low.unwrap_or(usize::MAX)).min(self.text.total())
+    }
+}
+
 pub struct Session {
     pub id: u32,
     pub cmd: String,
@@ -201,7 +208,7 @@ impl Session {
                     if prompt { Some(Outcome::Prompt) } else { (idle >= if busy { quiet * 5 } else { quiet }).then_some(Outcome::Quiet) }
                 }
                 Until::Pattern(re) => {
-                    let from = st.cursor.saturating_sub(st.text.dropped);
+                    let from = st.read_pos().saturating_sub(st.text.dropped);
                     (st.text.lines[from.min(st.text.lines.len())..].iter().any(|l| re.is_match(l)) || re.is_match(&st.text.cur)).then_some(Outcome::Matched)
                 }
             };
@@ -230,9 +237,12 @@ impl Session {
         let alt = st.screen.screen().alternate_screen() || std::mem::take(&mut st.alt_seen);
         let body = if alt {
             st.cursor = st.text.total();
+            st.text.low = None;
             st.last_partial = st.text.cur.trim_end().to_owned();
             screen_text(&st.screen)
         } else {
+            st.cursor = st.read_pos();
+            st.text.low = None;
             let lost = st.text.dropped.saturating_sub(st.cursor);
             let start = st.cursor.max(st.text.dropped);
             let mut new: Vec<String> = st.text.lines[start - st.text.dropped..].to_vec();
@@ -305,7 +315,7 @@ impl Session {
         let mut st = self.lock();
         if st.screen.screen().alternate_screen() { return None }
         let total = st.text.total();
-        let from = st.cursor.max(st.alert_from).max(st.text.dropped).min(total);
+        let from = st.read_pos().max(st.alert_from).max(st.text.dropped).min(total);
         let hits: Vec<&String> = st.text.lines[from - st.text.dropped..].iter().filter(|l| is_alert(l)).collect();
         let exit = st.exit.filter(|(code, at)| *code != 0 && *at > st.touched && !st.exit_alerted).map(|e| e.0);
         if hits.is_empty() && exit.is_none() { return None }
@@ -319,7 +329,7 @@ impl Session {
     /// next index to ask for and whether the process has finished. Not counted as agent traffic.
     pub fn tail(&self, from: usize) -> (usize, bool, Vec<String>) {
         let st = self.lock();
-        let start = from.max(st.text.dropped);
+        let start = from.max(st.text.dropped).min(st.text.total());
         let mut lines: Vec<String> = st.text.lines[start - st.text.dropped..].to_vec();
         let next = st.text.total();
         let done = st.exit.is_some() && (st.eof || st.exit.is_some_and(|e| e.1.elapsed() >= EXIT_DRAIN));
@@ -432,6 +442,18 @@ mod tests {
         let a = s.pending_alert().expect("it failed after the agent looked");
         assert_eq!(a.exit, Some(4));
         assert!(s.pending_alert().is_none());
+    }
+
+    #[test]
+    fn reading_after_a_redraw_erased_lines_does_not_panic() {
+        // The agent reads 3 lines, then the program moves the cursor up over them.
+        let s = run("printf 'a\\nb\\nc\\n'; sleep 1; printf '\\033[3A'; sleep 1; echo done");
+        s.wait_report(Until::Auto, QUIET, Duration::from_millis(600), budget());
+        thread::sleep(Duration::from_millis(1800));
+        let out = s.wait_report(Until::Auto, QUIET, Duration::from_secs(5), budget());
+        assert!(out.contains("done"), "{out}");
+        let (_, _, tail) = s.tail(99);
+        assert!(tail.len() <= 1);
     }
 
     #[test]

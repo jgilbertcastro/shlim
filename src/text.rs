@@ -24,6 +24,9 @@ pub struct Lines {
     pub dropped: usize,
     /// Bytes of plain text produced: what a plain shell tool would hand the model.
     pub plain_bytes: u64,
+    /// Lowest line index the text was cut back to (by a cursor-up redraw) since the last read.
+    /// Lines from there on were rewritten, so a reader positioned beyond it must come back.
+    pub low: Option<usize>,
     esc: Esc,
     csi: String,
     cr: bool,
@@ -90,7 +93,17 @@ impl Lines {
         let n = self.csi.trim_start_matches('?').split(';').next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
         match c {
             // Cursor up: the program is about to redraw lines it already printed.
-            'A' | 'F' => { let keep = self.lines.len().saturating_sub(n); self.lines.truncate(keep); self.cur.clear(); self.cr = false; }
+            'A' | 'F' => {
+                let keep = self.lines.len().saturating_sub(n);
+                // Erased lines were never output a plain shell would have kept: take them back out of the count.
+                let erased: u64 = self.lines[keep..].iter().map(|l| l.len() as u64 + 1).sum();
+                self.plain_bytes = self.plain_bytes.saturating_sub(erased);
+                self.lines.truncate(keep);
+                let at = self.total();
+                self.low = Some(self.low.map_or(at, |l| l.min(at)));
+                self.cur.clear();
+                self.cr = false;
+            }
             // Erase line.
             'K' if self.csi == "2" || (self.csi.is_empty() && self.cr) => { self.cur.clear(); self.cr = false; }
             // Cursor to column 1.
@@ -226,6 +239,19 @@ mod tests {
     fn cursor_up_redraw_replaces_lines() {
         let l = lines(b"a: 1%\nb: 1%\n\x1b[2A\x1b[2Ka: 100%\n\x1b[2Kb: 100%\n");
         assert_eq!(l.lines, ["a: 100%", "b: 100%"]);
+    }
+    #[test]
+    fn redrawn_progress_counts_only_its_final_state() {
+        // A docker-compose style block of 3 lines repainted 200 times.
+        let mut input = Vec::new();
+        for n in 0..200 {
+            if n > 0 { input.extend_from_slice(b"\x1b[3A") }
+            for name in ["web", "db", "cache"] { input.extend_from_slice(format!("\x1b[2K {name} Pulling {n}%\n").as_bytes()) }
+        }
+        let l = lines(&input);
+        assert_eq!(l.lines.len(), 3);
+        let final_bytes: u64 = l.lines.iter().map(|x| x.len() as u64 + 1).sum();
+        assert_eq!(l.plain_bytes, final_bytes, "erased frames must not count as output");
     }
     #[test]
     fn split_utf8_across_chunks() {
