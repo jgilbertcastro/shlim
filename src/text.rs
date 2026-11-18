@@ -113,10 +113,30 @@ fn clip(line: &str) -> String {
 }
 
 /// Lines worth surfacing even when they fall in the hidden middle of long output.
-static NOTABLE: LazyLock<Regex> = LazyLock::new(|| {
+pub static NOTABLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(errors?|failed|failures?|fatal|panic(ked)?|exception|traceback)\b").unwrap()
 });
 const MAX_NOTABLE: usize = 10;
+
+/// "0 errors", "Failed: 0": mentions an error word but reports that all is well.
+static BENIGN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(0|no|zero|without)\s+(errors?|failures?|failed)\b|\b(errors?|failed|failures?)\s*:\s*0\b").unwrap()
+});
+
+/// A line that reports a real problem (an error word, and not "0 errors").
+pub fn is_alert(line: &str) -> bool { NOTABLE.is_match(line) && !BENIGN.is_match(line) }
+
+static LOCATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*[\w./\\:~@+-]+(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?):?\s*").unwrap());
+static PROJECT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*\[[^\]]*\.(?:csproj|sln|vcxproj|fsproj)\]\s*$").unwrap());
+
+/// What an error says apart from where it happened: file, line, column and numbers removed, so
+/// 35 copies of the same mistake in 35 files count as one kind of error.
+pub fn signature(line: &str) -> String {
+    let body = LOCATION.replace(line, "");
+    let body = PROJECT.replace(&body, "");
+    let digits: String = body.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    digits.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// How much output one reply may carry.
 #[derive(Clone, Copy)]
@@ -168,10 +188,21 @@ pub fn compact_idx(lines: &[String], idx: &[usize], budget: Budget) -> String {
         runs[hidden.clone()].iter().map(|r| r.2).sum::<usize>(),
         runs[hidden.start].0
     ));
-    out.extend(runs[hidden.clone()].iter().zip(&rendered[hidden])
-        .filter(|(r, _)| NOTABLE.is_match(r.1))
-        .take(MAX_NOTABLE)
-        .map(|(r, l)| format!("! {}: {l}", r.0)));
+    // Errors hidden in the middle, one line per kind of error: where it first appeared and how many more.
+    let mut kinds: Vec<(usize, &str, usize, String)> = Vec::new(); // (first index, first line, count, signature)
+    for r in runs[hidden].iter().filter(|r| is_alert(r.1)) {
+        let sig = signature(r.1);
+        match kinds.iter_mut().find(|k| k.3 == sig) {
+            Some(k) => k.2 += r.2,
+            None => kinds.push((r.0, r.1, r.2, sig)),
+        }
+    }
+    out.extend(kinds.iter().take(MAX_NOTABLE).map(|(at, line, n, _)| {
+        if *n > 1 { format!("! {at}: {} (+{} similar)", clip(line), n - 1) } else { format!("! {at}: {}", clip(line)) }
+    }));
+    if kinds.len() > MAX_NOTABLE {
+        out.push(format!("! … {} more kinds of error (read grep=error)", kinds.len() - MAX_NOTABLE));
+    }
     out.extend_from_slice(&rendered[rendered.len() - tail..]);
     out.join("\n")
 }
@@ -225,6 +256,34 @@ mod tests {
         assert!(out.len() < 4600, "{}", out.len());
         assert!(out.contains("! 500: error[E0308]: mismatched types"), "{out}");
         assert!(out.ends_with(&v[999]));
+    }
+    #[test]
+    fn similar_errors_collapse_into_one_kind() {
+        let v: Vec<String> = (0..2000).map(|i| match i {
+            701 => "src/Other.cs(1,1): error CS0103: The name 'x' does not exist [/p/app.csproj]".into(),
+            801 => "Build finished with 0 errors".into(),
+            i if i % 2 == 0 && (100..1900).contains(&i) => format!("src/File{i}.cs({i},5): error CS0029: Cannot convert type 'string' to 'int' [/p/app.csproj]"),
+            _ => format!("noise {i} {}", "x".repeat(30)),
+        }).collect();
+        let out = compact(&v, 0, Budget { lines: 40, bytes: 4000 });
+        let bang: Vec<&str> = out.lines().filter(|l| l.starts_with("! ")).collect();
+        assert_eq!(bang.len(), 2, "{out}");
+        assert!(bang[0].contains("CS0029") && bang[0].contains("(+8") && bang[0].contains("similar"), "{}", bang[0]);
+        assert!(bang[1].contains("CS0103") && !bang[1].contains("similar"), "{}", bang[1]);
+        assert!(!out.contains("0 errors"), "benign line surfaced: {out}");
+    }
+    #[test]
+    fn signature_ignores_location_and_numbers() {
+        let a = signature("src/A.cs(3,9): error CS0029: Cannot convert 'string' to 'int' [/p/a.csproj]");
+        let b = signature("lib/deep/B.cs(120,1): error CS0029: Cannot convert 'string' to 'int' [/q/b.csproj]");
+        assert_eq!(a, b);
+        assert_ne!(a, signature("src/A.cs(3,9): error CS0103: The name 'x' does not exist"));
+        assert_eq!(signature("src/a.ts:12:3: error TS2304: nope"), signature("src/b.ts:99:1: error TS2304: nope"));
+    }
+    #[test]
+    fn alerts_skip_all_clear_lines() {
+        for ok in ["0 Error(s)", "Failed:     0, Passed: 41", "no errors found", "errors: 0"] { assert!(!is_alert(ok), "{ok}") }
+        for bad in ["error CS0029: x", "Build FAILED.", "Unhandled exception. System.X", "panic: boom"] { assert!(is_alert(bad), "{bad}") }
     }
     #[test]
     fn prompt_detection() {

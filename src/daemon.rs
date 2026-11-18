@@ -1,6 +1,6 @@
 //! Background process that owns every session, so sessions outlive the agent that started them.
 //! Protocol: one JSON request per line, one JSON response per line, over a Unix socket.
-use crate::session::{Session, Until, COLS, ROWS};
+use crate::session::{Opts, Session, Until, COLS, ROWS};
 use crate::text::Budget;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{atomic::{AtomicU32, Ordering}, mpsc, Arc, Mutex, MutexGuard},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub fn home() -> PathBuf {
@@ -59,7 +59,21 @@ impl Hub {
     }
 }
 
+/// When this daemon started; forced at startup so `stats` can say what period it covers.
+static STARTED: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// Local wall-clock time of something that happened `ago` ago.
+/// Short form: `17:51` today, `Nov 17 17:51` on another day. Long form: `2026-11-18 17:51:03`.
+fn when(ago: Duration, long: bool) -> String {
+    let now = chrono::Local::now();
+    let t = now - chrono::Duration::from_std(ago).unwrap_or_default();
+    if long { t.format("%Y-%m-%d %H:%M:%S").to_string() }
+    else if t.date_naive() == now.date_naive() { t.format("%H:%M").to_string() }
+    else { t.format("%b %d %H:%M").to_string() }
+}
+
 pub fn run() -> Result<()> {
+    std::sync::LazyLock::force(&STARTED);
     ensure_home()?;
     let path = sock();
     if UnixStream::connect(&path).is_ok() { return Ok(()) }
@@ -95,15 +109,38 @@ fn prune_logs() {
 fn max_sessions() -> usize { std::env::var("SHLIM_MAX_SESSIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(64) }
 
 /// Stops sessions nobody has used for `SHLIM_IDLE_MINUTES` (default 30) and that no human is watching.
+/// Sessions started with `keep: true` are never stopped here.
 fn reap(hub: &Hub) {
     let limit = Duration::from_secs(60 * std::env::var("SHLIM_IDLE_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(30u64));
     loop {
         thread::sleep(Duration::from_secs(60));
         let idle: Vec<Arc<Session>> = hub.sessions().values().filter(|s| {
             let st = s.lock();
-            st.watchers.is_empty() && st.touched.elapsed() > limit && st.last_out.elapsed() > limit
+            !s.keep && st.watchers.is_empty() && st.touched.elapsed() > limit && st.last_out.elapsed() > limit
         }).cloned().collect();
         for s in idle { s.kill(); hub.remove(&s); }
+    }
+}
+
+impl Hub {
+    /// Problems in sessions other than `skip` that the agent has not seen yet, ready to put in front of a reply.
+    fn alerts(&self, skip: Option<u64>) -> String {
+        let sessions: Vec<Arc<Session>> = self.sessions().values().filter(|s| Some(s.id as u64) != skip).cloned().collect();
+        let mut lines = Vec::new();
+        for s in sessions {
+            let Some(a) = s.pending_alert() else { continue };
+            let mut what = Vec::new();
+            if let Some(code) = a.exit { what.push(format!("exited {code}")) }
+            if a.errors > 0 { what.push(format!("{} new error line{}", a.errors, if a.errors == 1 { "" } else { "s" })) }
+            let first = a.first.map(|l| format!(": {}", short_cmd(&l, 110))).unwrap_or_default();
+            lines.push(format!("⚠ #{} `{}` {}{first} (read id={} grep=error)", s.id, short_cmd(&s.cmd, 40), what.join(", "), s.id));
+        }
+        if lines.len() > 3 {
+            let more = lines.len() - 3;
+            lines.truncate(3);
+            lines.push(format!("⚠ … {more} more sessions with problems (list)"));
+        }
+        lines.join("\n")
     }
 }
 
@@ -117,7 +154,10 @@ fn serve(hub: &Hub, conn: UnixStream) -> Result<()> {
         let req: Value = serde_json::from_str(&line).unwrap_or_default();
         let op = req["op"].as_str().unwrap_or("");
         if op == "attach" { return attach(hub, &req, reader, w) }
+        // Agents cannot be woken up, so problems in background sessions ride along on their next call.
+        let alerts = if req["alerts"].as_bool() == Some(true) && matches!(op, "run" | "send" | "read" | "kill" | "list") { hub.alerts(req["id"].as_u64()) } else { String::new() };
         let resp = match handle(hub, &req) {
+            Ok(text) if !alerts.is_empty() => json!({"ok": true, "text": format!("{alerts}\n{text}")}),
             Ok(text) => json!({"ok": true, "text": text}),
             Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
         };
@@ -186,7 +226,8 @@ fn handle(hub: &Hub, r: &Value) -> Result<String> {
             let id = hub.next.fetch_add(1, Ordering::SeqCst);
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let log = File::create(home().join("logs").join(format!("{id}-{stamp}.log"))).ok();
-            let s = Session::spawn(id, cmd, &cwd, log)?;
+            let env = r["env"].as_object().map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect());
+            let s = Session::spawn(id, cmd, &cwd, log, Opts { env, keep: r["keep"].as_bool() == Some(true) })?;
             hub.sessions().insert(id, s.clone());
             if r["wait"].as_bool() == Some(false) { return Ok(format!("[#{id} started]")) }
             Ok(s.wait_report(Until::Auto, quiet, secs(30.0), limit))
@@ -235,7 +276,7 @@ fn handle(hub: &Hub, r: &Value) -> Result<String> {
                 let state = st.exit.map_or("running".to_string(), |e| format!("exit {}", e.0));
                 let unread = st.text.plain_bytes.saturating_sub(st.read_bytes);
                 let unread = if unread >= 1024 { format!(" (+{} unread)", kb(unread)) } else { String::new() };
-                format!("#{} {state} {} `{}` {}→{}{unread}", s.id, age(s.started.elapsed().as_secs()), short_cmd(&s.cmd, 70), kb(st.read_bytes), kb(st.sent_bytes))
+                format!("#{} {state} {} @{} `{}` {}→{}{unread}{}", s.id, age(s.started.elapsed().as_secs()), when(s.started.elapsed(), false), short_cmd(&s.cmd, 70), kb(st.read_bytes), kb(st.sent_bytes), if s.keep { " [keep]" } else { "" })
             }).collect::<Vec<_>>().join("\n"))
         }
         "tail" => {
@@ -258,7 +299,8 @@ fn handle(hub: &Hub, r: &Value) -> Result<String> {
             let pct = if t.read > 0 { saved as f64 * 100.0 / t.read as f64 } else { 0.0 };
             let unread = t.produced.saturating_sub(t.read);
             Ok(format!(
-                "read by agent:   {} (~{} tokens, what a plain shell would have sent)\nsent to agent:   {} (~{} tokens)\nsaved:           ~{} tokens ({pct:.0}%)\nnever read:      {} (not counted; {} of it from running sessions)\ntokens are estimated as bytes/4",
+                "since {} (daemon up {}) · now {}\nread by agent:   {} (~{} tokens, what a plain shell would have sent)\nsent to agent:   {} (~{} tokens)\nsaved:           ~{} tokens ({pct:.0}%)\nnever read:      {} (not counted; {} of it from running sessions)\ntokens are estimated as bytes/4",
+                when(STARTED.elapsed(), true), age(STARTED.elapsed().as_secs()), when(Duration::ZERO, true),
                 kb(t.read), t.read / 4, kb(t.sent), t.sent / 4, saved / 4, kb(unread), kb(running)
             ))
         }

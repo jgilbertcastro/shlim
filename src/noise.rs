@@ -1,6 +1,7 @@
 //! Per-tool noise filters: lines that never help an agent decide what to do next
 //! (restore chatter, per-test "Passed" lines, docker layer progress, one line per compiled crate).
 //! Filtering only affects what is *sent*; the full text stays available through `read mode=all`.
+use crate::text::NOTABLE;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -53,8 +54,10 @@ pub fn filter(cmd: &str, lines: &[String], first: usize) -> (Vec<String>, Vec<us
     };
     for (i, l) in lines.iter().enumerate() {
         let abs = first + i;
+        // Safety net: a line that looks like an error is never routine, whatever the tool rules say.
+        let notable = NOTABLE.is_match(l);
         if cargo {
-            if let Some(c) = CARGO_STEP.captures(l) {
+            if let Some(c) = CARGO_STEP.captures(l).filter(|_| !notable) {
                 let name = c[2].to_owned();
                 match steps.as_mut() {
                     Some(s) => { s.1 += 1; s.3 = name; }
@@ -66,7 +69,7 @@ pub fn filter(cmd: &str, lines: &[String], first: usize) -> (Vec<String>, Vec<us
             flush(&mut steps, &mut out, &mut idx);
             // `Finished`/`Running` lines are routine too, but short and useful: kept.
         }
-        if drop_re.iter().any(|r| r.drop.is_match(l)) { dropped += 1; continue }
+        if !notable && drop_re.iter().any(|r| r.drop.is_match(l)) { dropped += 1; continue }
         out.push(l.clone());
         idx.push(abs);
     }
@@ -78,6 +81,59 @@ pub fn filter(cmd: &str, lines: &[String], first: usize) -> (Vec<String>, Vec<us
 mod tests {
     use super::*;
     fn v(s: &[&str]) -> Vec<String> { s.iter().map(|x| x.to_string()).collect() }
+
+    #[test]
+    fn error_looking_lines_are_never_dropped() {
+        let l = v(&["  Passed Tests.Errors.Are.Reported [3 ms]", "   Compiling error-chain v0.12.4", "   Compiling serde v1"]);
+        let (out, _, dropped) = filter("dotnet test", &l[..1], 0);
+        assert_eq!((out.len(), dropped), (1, 0));
+        let (out, _, _) = filter("cargo build", &l[1..], 0);
+        assert_eq!(out, ["   Compiling error-chain v0.12.4", "(1 crate step: serde)"]);
+    }
+
+    /// Real output of real tools (tests/fixtures, first line is the command). The filters must save
+    /// bytes without ever losing an error or a warning.
+    #[test]
+    fn real_outputs_keep_every_error_and_warning() {
+        use crate::text::Lines;
+        let fixtures = [
+            include_str!("../tests/fixtures/dotnet_build_warn.txt"),
+            include_str!("../tests/fixtures/dotnet_build_err.txt"),
+            include_str!("../tests/fixtures/pnpm_install.txt"),
+            include_str!("../tests/fixtures/cargo_build_err.txt"),
+            include_str!("../tests/fixtures/docker_build_err.txt"),
+            include_str!("../tests/fixtures/git_clone.txt"),
+        ];
+        let important = Regex::new(r"(?i)\b(warning|error)\b|\bFAILED\b|^\s*[0-9]+ (warning|error)").unwrap();
+        for f in fixtures {
+            let (cmd, body) = f.split_once('\n').unwrap();
+            let cmd = cmd.trim_start_matches("$ ");
+            let mut t = Lines::default();
+            t.feed(body.as_bytes());
+            let (kept, _, dropped) = filter(cmd, &t.lines, 0);
+            for line in t.lines.iter().filter(|l| important.is_match(l)) {
+                assert!(kept.contains(line), "`{cmd}` lost an important line: {line}");
+            }
+            assert!(dropped <= t.lines.len(), "`{cmd}` accounting");
+        }
+    }
+
+    #[test]
+    fn real_noisy_outputs_shrink() {
+        use crate::text::Lines;
+        for (f, max_pct) in [
+            (include_str!("../tests/fixtures/docker_build_err.txt"), 85),
+            (include_str!("../tests/fixtures/pnpm_install.txt"), 85),
+            (include_str!("../tests/fixtures/dotnet_build_warn.txt"), 85),
+        ] {
+            let (cmd, body) = f.split_once('\n').unwrap();
+            let mut t = Lines::default();
+            t.feed(body.as_bytes());
+            let (kept, _, _) = filter(cmd.trim_start_matches("$ "), &t.lines, 0);
+            let (before, after) = (t.lines.join("\n").len(), kept.join("\n").len());
+            assert!(after * 100 <= before * max_pct, "`{cmd}`: {before} -> {after} bytes");
+        }
+    }
 
     #[test]
     fn unknown_commands_are_untouched() {

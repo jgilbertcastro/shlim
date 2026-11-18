@@ -29,7 +29,11 @@ pub fn connect() -> Result<UnixStream> {
     bail!("shlim daemon did not start; see {}", home().join("daemon.log").display())
 }
 
-pub fn request(req: Value) -> Result<String> {
+pub fn request(mut req: Value) -> Result<String> {
+    // A new session runs with the environment of the client that asks (PATH, SDK variables, …).
+    if req["op"] == "run" && req.get("env").is_none() {
+        req["env"] = Value::Object(std::env::vars().map(|(k, v)| (k, Value::String(v))).collect());
+    }
     let mut s = connect()?;
     writeln!(s, "{req}")?;
     let mut line = String::new();

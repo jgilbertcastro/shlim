@@ -1,0 +1,5 @@
+$ git clone --progress https://github.com/octocat/Hello-World.git
+Cloning into 'gt'...
+remote: Enumerating objects: 13, done.        
+remote: Total 13 (delta 0), reused 0 (delta 0), pack-reused 13 (from 1)        
+Receiving objects:   7% (1/13)Receiving objects:  15% (2/13)Receiving objects:  23% (3/13)Receiving objects:  30% (4/13)Receiving objects:  38% (5/13)Receiving objects:  46% (6/13)Receiving objects:  53% (7/13)Receiving objects:  61% (8/13)Receiving objects:  69% (9/13)Receiving objects:  76% (10/13)Receiving objects:  84% (11/13)Receiving objects:  92% (12/13)Receiving objects: 100% (13/13)Receiving objects: 100% (13/13), done.

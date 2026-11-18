@@ -11,7 +11,7 @@ fn tools() -> Value {
     let timeout = json!({"type": "number", "description": "seconds"});
     json!([
         {"name": "run", "description": "Run a shell command in a persistent PTY. Returns when it exits, goes idle, or asks for input. Output with no [#id …] header means it finished with exit 0.",
-         "inputSchema": {"type": "object", "properties": {"cmd": {"type": "string"}, "cwd": {"type": "string"}, "timeout": timeout}, "required": ["cmd"]}},
+         "inputSchema": {"type": "object", "properties": {"cmd": {"type": "string"}, "cwd": {"type": "string"}, "timeout": timeout, "keep": {"type": "boolean", "description": "never stop it for being idle (quiet servers, tunnels)"}}, "required": ["cmd"]}},
         {"name": "send", "description": "Send input to a session, then return its reply. keys: enter tab esc up down left right backspace ctrl+<letter>.",
          "inputSchema": {"type": "object", "properties": {"id": id, "text": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}}, "submit": {"type": "boolean", "description": "press Enter after text"}, "timeout": timeout}, "required": ["id"]}},
         {"name": "read", "description": "Read a session. Default: output since last read. wait: exit|quiet|<regex> blocks first. mode=screen for full-screen apps, mode=all with from/grep for history.",
@@ -67,6 +67,7 @@ fn call(params: &Value) -> Value {
         Err(e) => return json!({"content": [{"type": "text", "text": format!("error: {e}")}], "isError": true}),
     };
     req["op"] = json!(name);
+    req["alerts"] = json!(true);
     // Default to the agent's project directory, not the daemon's.
     if name == "run" && req["cwd"].is_null() {
         if let Ok(dir) = std::env::current_dir() { req["cwd"] = json!(dir.to_string_lossy()) }
