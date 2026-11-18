@@ -31,6 +31,14 @@ jobs:
       - name: musl tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Stamp the version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # `shlim --version` and `shlim doctor` must report the release they came from.
+          v="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
+          cargo update --workspace
+          grep -m1 '^version' Cargo.toml
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package

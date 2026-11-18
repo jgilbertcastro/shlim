@@ -1,6 +1,6 @@
 //! One PTY-backed process, its plain-text view, its rendered screen and its token accounting.
 use crate::noise;
-use crate::text::{compact, compact_idx, is_alert, Budget, Lines, PROMPT};
+use crate::text::{compact, compact_idx, is_alert, squeeze, Budget, Lines, PROMPT};
 use anyhow::{bail, Context, Result};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -92,10 +92,18 @@ impl Session {
         b.args(["-c", cmd]);
         b.cwd(cwd);
         // The environment of the client that asked, not of whichever process happened to start the daemon.
+        let defined = |k: &str| match &opts.env {
+            Some(env) => env.iter().any(|(name, _)| name == k),
+            None => std::env::var_os(k).is_some(),
+        };
+        // Docker redraws a wide, padded progress display in a terminal; plain lines cost fewer tokens.
+        // Only a default: anything the client set itself wins.
+        let plain_progress: Vec<&str> = ["BUILDKIT_PROGRESS", "COMPOSE_PROGRESS"].into_iter().filter(|k| !defined(k)).collect();
         if let Some(env) = opts.env {
             b.env_clear();
             for (k, v) in env { b.env(k, v) }
         }
+        for k in plain_progress { b.env(k, "plain") }
         b.env("TERM", "xterm-256color");
         // Pagers would trap the agent in an interactive screen.
         for k in ["PAGER", "GIT_PAGER", "MANPAGER"] { b.env(k, "cat") }
@@ -256,6 +264,7 @@ impl Session {
             // What a plain shell tool would have handed the model for this read.
             st.read_bytes += new.iter().map(|l| l.len() as u64 + 1).sum::<u64>();
             let (kept, idx, dropped) = noise::filter(&self.cmd, &new, start);
+            let kept: Vec<String> = kept.iter().map(|l| squeeze(l)).collect();
             let mut b = compact_idx(&kept, &idx, budget);
             if dropped >= 5 { b.push_str(&format!("\n… {dropped} routine lines omitted (read mode=all to see them) …")) }
             if lost > 0 { b = format!("… {lost} older lines only in log …\n{b}") }
@@ -454,6 +463,25 @@ mod tests {
         assert!(out.contains("done"), "{out}");
         let (_, _, tail) = s.tail(99);
         assert!(tail.len() <= 1);
+    }
+
+    #[test]
+    fn docker_progress_defaults_to_plain_but_the_client_wins() {
+        let probe = "echo \"[${BUILDKIT_PROGRESS:-unset}] [${COMPOSE_PROGRESS:-unset}]\"";
+        let spawn = |env: Option<Vec<(String, String)>>| Session::spawn(1, probe, "/tmp", None, Opts { env, keep: false }).unwrap();
+        let read = |s: Arc<Session>| s.wait_report(Until::Auto, QUIET, Duration::from_secs(10), budget());
+        let path = ("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        assert_eq!(read(spawn(Some(vec![path.clone()]))), "[plain] [plain]");
+        assert_eq!(read(spawn(Some(vec![path, ("BUILDKIT_PROGRESS".into(), "tty".into())]))), "[tty] [plain]");
+    }
+
+    #[test]
+    fn padded_terminal_lines_are_squeezed_in_replies_only() {
+        let s = run("printf '  indented      then      padded\\n'");
+        let out = s.wait_report(Until::Auto, QUIET, Duration::from_secs(10), budget());
+        assert_eq!(out, "  indented  then  padded");
+        let all = s.lines(0, None, 10);
+        assert!(all.contains("indented      then      padded"), "read mode=all stays verbatim: {all}");
     }
 
     #[test]

@@ -142,7 +142,7 @@ persist (dev servers, REPLs, ssh). Start long-running programs with
   <table>
     <tr><th style="width:27%">Command family</th><th>Dropped</th><th style="width:30%">Always kept</th></tr>
     <tr><td><code>dotnet</code> build · test · restore</td><td>restore chatter, <code>proj -&gt; bin.dll</code>, per-test <code>Passed …</code></td><td>errors, warnings, <code>Failed …</code>, summary</td></tr>
-    <tr><td><code>npm</code> · <code>pnpm</code> · <code>yarn</code> · <code>bun</code></td><td><code>Progress: resolved …</code>, <code>+++</code> bars, lockfile notices</td><td>errors, real warnings</td></tr>
+    <tr><td><code>npm</code> · <code>pnpm</code> · <code>yarn</code> · <code>bun</code></td><td><code>Progress: resolved …</code>, <code>+++</code> bars, lockfile notices</td><td>errors, other warnings</td></tr>
     <tr><td><code>docker</code> build · up · pull</td><td><code>#5 DONE</code>, <code>CACHED</code>, layer pull progress</td><td>build errors, service logs</td></tr>
     <tr><td><code>git</code> clone · fetch · pull · push</td><td>counting / compressing / receiving progress</td><td>refs, errors</td></tr>
     <tr><td><code>cargo</code> build · test · check</td><td>one line per crate → <code>(37 crate steps, last: serde)</code></td><td>warnings, errors, <code>Finished</code></td></tr>
@@ -179,13 +179,25 @@ never read:      0B (not counted)</code></pre>
     <tr><td><code>SHLIM_MAX_SESSIONS</code></td><td><code>64</code></td><td>Maximum sessions running at once.</td></tr>
     <tr><td><code>SHLIM_LOG_DAYS</code></td><td><code>7</code></td><td>Delete raw logs older than this when the daemon starts.</td></tr>
   </table>
-  <p>State lives in a <code>0700</code> directory and the socket is owner-only. Each session runs with the environment of the client that started it, and pagers are disabled (<code>PAGER=cat</code>) so nothing traps the agent in an interactive screen.</p>
+  <p>State lives in a <code>0700</code> directory and the socket is owner-only. Each session runs with the environment of the client that started it. Pagers are disabled (<code>PAGER=cat</code>) so nothing traps the agent, Docker prints plain progress, and padding spaces are squeezed in replies.</p>
 
   <div class="foot"><span>shlim · documentation</span><span>6</span></div>
 </section>
 
 <section class="page">
-  <h1>Project layout</h1>
+  <h1>Measured savings</h1>
+  <table>
+    <tr><th>Command</th><th>Plain shell</th><th>With shlim</th><th>Saved</th></tr>
+    <tr><td><code>dotnet build</code> (80 warnings)</td><td>30,953 B</td><td>4,175 B</td><td>86%</td></tr>
+    <tr><td><code>dotnet test</code> (60 tests)</td><td>3,461 B</td><td>659 B</td><td>80%</td></tr>
+    <tr><td><code>npm install</code></td><td>1,634 B</td><td>81 B</td><td>95%</td></tr>
+    <tr><td><code>pnpm install</code></td><td>571 B</td><td>408 B</td><td>28%</td></tr>
+    <tr><td><code>cargo build</code> (3 deps)</td><td>571 B</td><td>155 B</td><td>72%</td></tr>
+    <tr><td><code>docker build</code></td><td>5,712 B</td><td>4,728 B</td><td>17%</td></tr>
+  </table>
+  <p class="note">One run each, warm caches, noisy on purpose (80 repeated warnings, 60 passing tests); a clean build saves less. The npm figure includes hiding deprecation notices (<code>read mode=all</code> brings them back). Reproduce on your machine: <code>scripts/bench.sh</code>.</p>
+
+  <h1 style="margin-top:8mm">Project layout</h1>
 <pre><code>src/
 ├── main.rs      CLI, install, doctor, logs
 ├── mcp.rs       MCP server over stdio · argument normalisation

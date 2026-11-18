@@ -119,6 +119,19 @@ impl Lines {
     }
 }
 
+/// Runs of three or more spaces inside a line (terminal padding, aligned columns) become two.
+/// Leading indentation is kept. Used on what is sent to the agent, never on the stored text.
+pub fn squeeze(line: &str) -> String {
+    let body = line.trim_start_matches(' ');
+    let mut out = String::with_capacity(line.len());
+    out.push_str(&line[..line.len() - body.len()]);
+    let mut run = 0;
+    for c in body.chars() {
+        if c == ' ' { run += 1; if run <= 2 { out.push(' ') } } else { run = 0; out.push(c) }
+    }
+    out
+}
+
 fn clip(line: &str) -> String {
     if line.chars().count() <= MAX_LINE_CHARS { return line.to_owned() }
     let head: String = line.chars().take(MAX_LINE_CHARS).collect();
@@ -133,7 +146,7 @@ const MAX_NOTABLE: usize = 10;
 
 /// "0 errors", "Failed: 0": mentions an error word but reports that all is well.
 static BENIGN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(0|no|zero|without)\s+(errors?|failures?|failed)\b|\b(errors?|failed|failures?)\s*:\s*0\b").unwrap()
+    Regex::new(r"(?i)\b(0|no|zero|without)\s+(errors?|failures?|failed|warnings?)\b|\b(errors?|failed|failures?|warnings?)\s*:\s*0\b|\b0\s+warning\(s\)").unwrap()
 });
 
 /// A line that reports a real problem (an error word, and not "0 errors").
@@ -147,8 +160,48 @@ static PROJECT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*\[[^\]]*\.(?:
 pub fn signature(line: &str) -> String {
     let body = LOCATION.replace(line, "");
     let body = PROJECT.replace(&body, "");
-    let digits: String = body.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
-    digits.split_whitespace().collect::<Vec<_>>().join(" ")
+    // A number becomes `#`, except right after a capital letter, where it is part of an error code (CS0029, E0308).
+    let mut out = String::with_capacity(body.len());
+    let mut prev = ' ';
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            let mut run = String::from(c);
+            while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) { run.push(d); chars.next(); }
+            if prev.is_ascii_uppercase() { out.push_str(&run) } else { out.push('#') }
+            prev = '0';
+        } else {
+            out.push(c);
+            prev = c;
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const MAX_WARNINGS: usize = 5;
+
+static WARNING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bwarn(ing)?s?\b").unwrap());
+
+/// A warning line that is not an error and not an "0 warnings" summary.
+pub fn is_warning(line: &str) -> bool { WARNING.is_match(line) && !BENIGN.is_match(line) && !is_alert(line) }
+
+/// Lines picked by `pick`, one entry per kind (same `signature`): `{mark} {index}: {first line} (+N similar)`.
+fn group_kinds(runs: &[(usize, &str, usize)], pick: fn(&str) -> bool, mark: &str, what: &str, max: usize) -> Vec<String> {
+    let mut kinds: Vec<(usize, &str, usize, String)> = Vec::new(); // (first index, first line, count, signature)
+    for r in runs.iter().filter(|r| pick(r.1)) {
+        let sig = signature(r.1);
+        match kinds.iter_mut().find(|k| k.3 == sig) {
+            Some(k) => k.2 += r.2,
+            None => kinds.push((r.0, r.1, r.2, sig)),
+        }
+    }
+    let mut out: Vec<String> = kinds.iter().take(max).map(|(at, line, n, _)| {
+        if *n > 1 { format!("{mark} {at}: {} (+{} similar)", clip(line), n - 1) } else { format!("{mark} {at}: {}", clip(line)) }
+    }).collect();
+    if kinds.len() > max {
+        out.push(format!("{mark} … {} more kinds of {what} (read grep={what})", kinds.len() - max));
+    }
+    out
 }
 
 /// How much output one reply may carry.
@@ -201,21 +254,10 @@ pub fn compact_idx(lines: &[String], idx: &[usize], budget: Budget) -> String {
         runs[hidden.clone()].iter().map(|r| r.2).sum::<usize>(),
         runs[hidden.start].0
     ));
-    // Errors hidden in the middle, one line per kind of error: where it first appeared and how many more.
-    let mut kinds: Vec<(usize, &str, usize, String)> = Vec::new(); // (first index, first line, count, signature)
-    for r in runs[hidden].iter().filter(|r| is_alert(r.1)) {
-        let sig = signature(r.1);
-        match kinds.iter_mut().find(|k| k.3 == sig) {
-            Some(k) => k.2 += r.2,
-            None => kinds.push((r.0, r.1, r.2, sig)),
-        }
-    }
-    out.extend(kinds.iter().take(MAX_NOTABLE).map(|(at, line, n, _)| {
-        if *n > 1 { format!("! {at}: {} (+{} similar)", clip(line), n - 1) } else { format!("! {at}: {}", clip(line)) }
-    }));
-    if kinds.len() > MAX_NOTABLE {
-        out.push(format!("! … {} more kinds of error (read grep=error)", kinds.len() - MAX_NOTABLE));
-    }
+    // Problems hidden in the middle, one line per kind: where it first appeared and how many more.
+    // Errors come first and get more room; warnings follow, marked with `~`.
+    out.extend(group_kinds(&runs[hidden.clone()], is_alert, "!", "error", MAX_NOTABLE));
+    out.extend(group_kinds(&runs[hidden], is_warning, "~", "warning", MAX_WARNINGS));
     out.extend_from_slice(&rendered[rendered.len() - tail..]);
     out.join("\n")
 }
@@ -299,17 +341,48 @@ mod tests {
         assert!(!out.contains("0 errors"), "benign line surfaced: {out}");
     }
     #[test]
+    fn similar_warnings_collapse_after_the_errors() {
+        let v: Vec<String> = (0..600).map(|i| match i {
+            300 => "src/E.cs(1,1): error CS1002: ; expected [/p/app.csproj]".into(),
+            301 => "    0 Warning(s)".into(),
+            302 => "src/G.cs(9,9): warning CS8600: Converting null literal [/p/app.csproj]".into(),
+            i if i % 3 == 0 => format!("src/F{i}.cs({i},5): warning CS0219: The variable 'u{i}' is assigned but its value is never used [/p/app.csproj]"),
+            _ => format!("noise {i} {}", "x".repeat(30)),
+        }).collect();
+        let out = compact(&v, 0, Budget { lines: 40, bytes: 4000 });
+        let marks: Vec<&str> = out.lines().filter(|l| l.starts_with("! ") || l.starts_with("~ ")).collect();
+        assert_eq!(marks.len(), 3, "{out}");
+        assert!(marks[0].starts_with("! 300") && !marks[0].contains("similar"), "{}", marks[0]);
+        assert!(marks[1].starts_with("~ ") && marks[1].contains("CS0219") && marks[1].contains("similar"), "{}", marks[1]);
+        assert!(marks[2].contains("CS8600") && !marks[2].contains("similar"), "{}", marks[2]);
+        assert!(!out.contains("0 Warning(s)"), "benign summary surfaced: {out}");
+    }
+    #[test]
+    fn warning_detection_ignores_all_clear_summaries() {
+        for ok in ["    0 Warning(s)", "warnings: 0", "no warnings"] { assert!(!is_warning(ok), "{ok}") }
+        for bad in ["src/a.cs(1,1): warning CS0219: x", "npm warn deprecated x", "WARNING: something"] { assert!(is_warning(bad), "{bad}") }
+        assert!(!is_warning("error: boom with a warning attached"), "errors are not warnings");
+    }
+    #[test]
     fn signature_ignores_location_and_numbers() {
         let a = signature("src/A.cs(3,9): error CS0029: Cannot convert 'string' to 'int' [/p/a.csproj]");
         let b = signature("lib/deep/B.cs(120,1): error CS0029: Cannot convert 'string' to 'int' [/q/b.csproj]");
         assert_eq!(a, b);
         assert_ne!(a, signature("src/A.cs(3,9): error CS0103: The name 'x' does not exist"));
+        assert_eq!(signature("w.cs(1,1): warning CS0219: variable 'u12' unused"), signature("w.cs(2,2): warning CS0219: variable 'u102' unused"));
+        assert_ne!(signature("e.cs(1,1): error CS0103: same words"), signature("e.cs(1,1): error CS0104: same words"));
         assert_eq!(signature("src/a.ts:12:3: error TS2304: nope"), signature("src/b.ts:99:1: error TS2304: nope"));
     }
     #[test]
     fn alerts_skip_all_clear_lines() {
         for ok in ["0 Error(s)", "Failed:     0, Passed: 41", "no errors found", "errors: 0"] { assert!(!is_alert(ok), "{ok}") }
         for bad in ["error CS0029: x", "Build FAILED.", "Unhandled exception. System.X", "panic: boom"] { assert!(is_alert(bad), "{bad}") }
+    }
+    #[test]
+    fn squeeze_keeps_indentation_and_short_gaps() {
+        assert_eq!(squeeze("    a      b  c"), "    a  b  c");
+        assert_eq!(squeeze("x"), "x");
+        assert_eq!(squeeze(" => [2/5] RUN apk add                    8.4s"), " => [2/5] RUN apk add  8.4s");
     }
     #[test]
     fn prompt_detection() {
