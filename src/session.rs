@@ -1,6 +1,6 @@
 //! One PTY-backed process, its plain-text view, its rendered screen and its token accounting.
 use crate::noise;
-use crate::text::{compact, compact_idx, Budget, Lines, PROMPT};
+use crate::text::{compact, compact_idx, is_alert, Budget, Lines, PROMPT};
 use anyhow::{bail, Context, Result};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -40,6 +40,9 @@ pub struct State {
     echo: Option<String>,
     /// Last time the agent or a human used the session.
     pub touched: Instant,
+    /// Absolute line index up to which background errors have already been pointed out to the agent.
+    alert_from: usize,
+    exit_alerted: bool,
     pub raw_bytes: u64,
     /// Plain bytes of output the agent actually asked for (what a normal shell tool would have sent).
     pub read_bytes: u64,
@@ -51,6 +54,8 @@ pub struct State {
 pub struct Session {
     pub id: u32,
     pub cmd: String,
+    /// Exempt from the idle cleanup (quiet servers, tunnels, databases).
+    pub keep: bool,
     pub started: Instant,
     st: Mutex<State>,
     cond: Condvar,
@@ -59,10 +64,18 @@ pub struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
 }
 
+/// Per-session options chosen by the client.
+#[derive(Default)]
+pub struct Opts {
+    /// Full environment for the command; `None` inherits the daemon's.
+    pub env: Option<Vec<(String, String)>>,
+    pub keep: bool,
+}
+
 fn nz(v: u16) -> NonZeroU16 { NonZeroU16::new(v.max(1)).unwrap() }
 
 impl Session {
-    pub fn spawn(id: u32, cmd: &str, cwd: &str, log: Option<File>) -> Result<Arc<Self>> {
+    pub fn spawn(id: u32, cmd: &str, cwd: &str, log: Option<File>, opts: Opts) -> Result<Arc<Self>> {
         let pair = native_pty_system()
             .openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })
             .context("openpty")?;
@@ -71,6 +84,11 @@ impl Session {
         let mut b = CommandBuilder::new(&shell);
         b.args(["-c", cmd]);
         b.cwd(cwd);
+        // The environment of the client that asked, not of whichever process happened to start the daemon.
+        if let Some(env) = opts.env {
+            b.env_clear();
+            for (k, v) in env { b.env(k, v) }
+        }
         b.env("TERM", "xterm-256color");
         // Pagers would trap the agent in an interactive screen.
         for k in ["PAGER", "GIT_PAGER", "MANPAGER"] { b.env(k, "cat") }
@@ -82,6 +100,7 @@ impl Session {
         let session = Arc::new(Session {
             id,
             cmd: cmd.to_owned(),
+            keep: opts.keep,
             started: now,
             st: Mutex::new(State {
                 text: Lines::default(),
@@ -94,6 +113,8 @@ impl Session {
                 alt_seen: false,
                 echo: None,
                 touched: now,
+                alert_from: 0,
+                exit_alerted: false,
                 raw_bytes: 0,
                 read_bytes: 0,
                 sent_bytes: 0,
@@ -252,6 +273,7 @@ impl Session {
     pub fn screen(&self) -> String {
         let mut st = self.lock();
         let body = screen_text(&st.screen);
+        st.alert_from = st.text.total();
         let out = format!("{}\n{body}", self.header(&st, &Outcome::Quiet));
         st.read_bytes += body.len() as u64;
         st.sent_bytes += out.len() as u64;
@@ -269,10 +291,28 @@ impl Session {
             .map(|(i, l)| format!("{i}: {l}"))
             .collect();
         let body = picked.join("\n");
+        // Reading everything, or searching for errors, counts as having seen the errors.
+        if picked.len() < limit && grep.is_none_or(|re| re.is_match("error") || re.is_match("failed")) { st.alert_from = st.text.total() }
         let out = format!("{} {} of {} lines\n{body}", self.header(&st, &Outcome::Quiet), picked.len(), st.text.total());
         st.read_bytes += body.len() as u64;
         st.sent_bytes += out.len() as u64;
         out
+    }
+
+    /// Something the agent has not seen yet in this session: new error lines since it last looked,
+    /// or a non-zero exit it was not told about. Reported once, then considered seen.
+    pub fn pending_alert(&self) -> Option<Alert> {
+        let mut st = self.lock();
+        if st.screen.screen().alternate_screen() { return None }
+        let total = st.text.total();
+        let from = st.cursor.max(st.alert_from).max(st.text.dropped).min(total);
+        let hits: Vec<&String> = st.text.lines[from - st.text.dropped..].iter().filter(|l| is_alert(l)).collect();
+        let exit = st.exit.filter(|(code, at)| *code != 0 && *at > st.touched && !st.exit_alerted).map(|e| e.0);
+        if hits.is_empty() && exit.is_none() { return None }
+        let alert = Alert { errors: hits.len(), first: hits.first().map(|l| l.to_string()), exit };
+        st.alert_from = total;
+        if exit.is_some() { st.exit_alerted = true }
+        Some(alert)
     }
 
     /// Plain lines from absolute index `from`, for a human following the session. Returns the
@@ -288,6 +328,9 @@ impl Session {
     }
 }
 
+/// What changed in a session the agent is not looking at.
+pub struct Alert { pub errors: usize, pub first: Option<String>, pub exit: Option<i32> }
+
 fn screen_text(p: &vt100::Parser) -> String {
     let lines: Vec<String> = p.screen().contents().lines().map(|l| l.trim_end().to_owned()).collect();
     // Collapses runs like vim's `~` filler rows; never hides rows of a single screen.
@@ -298,7 +341,7 @@ fn screen_text(p: &vt100::Parser) -> String {
 mod tests {
     use super::*;
 
-    fn run(cmd: &str) -> Arc<Session> { Session::spawn(1, cmd, "/tmp", None).unwrap() }
+    fn run(cmd: &str) -> Arc<Session> { Session::spawn(1, cmd, "/tmp", None, Opts::default()).unwrap() }
     fn budget() -> Budget { Budget { lines: 100, bytes: 4000 } }
     const QUIET: Duration = Duration::from_millis(300);
 
@@ -347,6 +390,48 @@ mod tests {
         let st = s.lock();
         assert_eq!(st.read_bytes, 300 * 5);
         assert!(st.sent_bytes < 100);
+    }
+
+    #[test]
+    fn session_uses_the_environment_of_the_client() {
+        let env = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned()), ("FROM_CLIENT".to_owned(), "yes".to_owned())];
+        let s = Session::spawn(1, "echo \"[$FROM_CLIENT] [${DAEMON_ONLY:-unset}]\"", "/tmp", None, Opts { env: Some(env), keep: true }).unwrap();
+        assert!(s.keep);
+        let out = s.wait_report(Until::Auto, QUIET, Duration::from_secs(10), budget());
+        assert_eq!(out, "[yes] [unset]");
+    }
+
+    #[test]
+    fn background_errors_are_alerted_once_and_reading_clears_them() {
+        let s = run("echo started; sleep 1; echo 'Build finished: 0 errors'; echo 'src/a.ts(3,1): error TS2304: nope'; echo 'src/b.ts(9,1): error TS2304: nope'; sleep 30");
+        s.wait_report(Until::Auto, QUIET, Duration::from_secs(10), budget());
+        assert!(s.pending_alert().is_none(), "nothing new yet");
+        thread::sleep(Duration::from_millis(1800));
+        let a = s.pending_alert().expect("two error lines arrived while the agent was away");
+        assert_eq!(a.errors, 2);
+        assert!(a.first.unwrap().contains("TS2304") && a.exit.is_none());
+        assert!(s.pending_alert().is_none(), "reported only once");
+        s.kill();
+    }
+
+    #[test]
+    fn a_read_of_the_errors_means_no_alert() {
+        let s = run("sleep 1; echo 'error: boom'; sleep 30");
+        s.wait_report(Until::Auto, QUIET, Duration::from_secs(10), budget());
+        thread::sleep(Duration::from_millis(1500));
+        s.wait_report(Until::Auto, QUIET, Duration::from_secs(5), budget());
+        assert!(s.pending_alert().is_none());
+        s.kill();
+    }
+
+    #[test]
+    fn unseen_failure_exit_is_alerted() {
+        let s = run("sleep 1; exit 4");
+        s.wait_report(Until::Auto, QUIET, Duration::from_secs(5), budget());
+        thread::sleep(Duration::from_millis(1800));
+        let a = s.pending_alert().expect("it failed after the agent looked");
+        assert_eq!(a.exit, Some(4));
+        assert!(s.pending_alert().is_none());
     }
 
     #[test]

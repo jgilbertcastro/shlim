@@ -2,12 +2,20 @@
 name = "shlim"
 version = "0.1.0"
 edition = "2024"
+description = "Persistent, token-lean shell for AI coding agents, over MCP"
+license = "MIT"
+repository = "https://github.com/jgilbertcastro/shlim"
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
 portable-pty = "0.9.0"
 regex = "1.13.1"
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 vt100 = "0.18.1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

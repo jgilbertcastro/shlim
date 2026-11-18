@@ -1,0 +1,95 @@
+name: release
+
+# Publishing a tag such as v0.1.0 builds shlim for macOS and Linux and attaches the
+# binaries (plus checksums) to a GitHub release. install.sh downloads them from there.
+on:
+  push:
+    tags: ["v*"]
+  # Manual run from the Actions tab: builds every target and uploads the files as workflow
+  # artifacts, but publishes nothing. Use it to test the pipeline.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,        os: macos-14 }
+          - { target: x86_64-apple-darwin,         os: macos-14 }
+          - { target: x86_64-unknown-linux-musl,   os: ubuntu-24.04,     musl: true }
+          - { target: aarch64-unknown-linux-musl,  os: ubuntu-24.04-arm, musl: true }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup target add ${{ matrix.target }}
+      - name: musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/shlim-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release shlim
+          cd dist
+          shasum -a 256 shlim-${{ matrix.target }}.tar.gz > shlim-${{ matrix.target }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shlim-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+
+  homebrew:
+    # Updates the formula in the tap repository (jgilbertcastro/homebrew-shlim).
+    # Needs the repository secret HOMEBREW_TAP_TOKEN: a token with write access to that repo.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check token
+        id: token
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then echo "HOMEBREW_TAP_TOKEN is not set: skipping the tap update."; echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.skip != 'true'
+        with:
+          repository: jgilbertcastro/homebrew-shlim
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Write formula and push
+        if: steps.token.outputs.skip != 'true'
+        run: |
+          mkdir -p tap/Formula
+          scripts/gen-formula.sh "$GITHUB_REF_NAME" dist > tap/Formula/shlim.rb
+          cd tap
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add Formula/shlim.rb
+          git diff --cached --quiet || git commit -m "shlim $GITHUB_REF_NAME"
+          git push

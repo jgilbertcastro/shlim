@@ -1,0 +1,14 @@
+$ cd backend && dotnet build
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+/work/dn/app/Program.cs(3,9): error CS0029: Cannot implicitly convert type 'string' to 'int' [/work/dn/app/app.csproj]
+/work/dn/app/Program.cs(2,5): warning CS0219: The variable 'unused' is assigned but its value is never used [/work/dn/app/app.csproj]
+
+Build FAILED.
+
+/work/dn/app/Program.cs(2,5): warning CS0219: The variable 'unused' is assigned but its value is never used [/work/dn/app/app.csproj]
+/work/dn/app/Program.cs(3,9): error CS0029: Cannot implicitly convert type 'string' to 'int' [/work/dn/app/app.csproj]
+    1 Warning(s)
+    1 Error(s)
+
+Time Elapsed 00:00:00.54

@@ -1,0 +1,13 @@
+$ dotnet build
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+/work/dn/app/Program.cs(2,5): warning CS0219: The variable 'unused' is assigned but its value is never used [/work/dn/app/app.csproj]
+  app -> /work/dn/app/bin/Debug/net10.0/app.dll
+
+Build succeeded.
+
+/work/dn/app/Program.cs(2,5): warning CS0219: The variable 'unused' is assigned but its value is never used [/work/dn/app/app.csproj]
+    1 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:01.48
