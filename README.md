@@ -62,7 +62,7 @@ Ready-made binary for macOS (Apple Silicon / Intel) and Linux (x86_64 / ARM64), 
 curl -fsSL https://raw.githubusercontent.com/jgilbertcastro/shlim/main/install.sh | sh
 ```
 
-It downloads the same binary, checks its SHA-256 and puts it in `~/.local/bin`. To build from source instead: `cargo install --path .`
+It downloads the same binary, checks its SHA-256 and puts it in `~/.local/bin`. Pre-releases (`-rc` tags) are skipped by default; to install one, add `SHLIM_VERSION=v0.0.2-rc1` before `sh`. To build from source instead: `cargo install --path .`
 
 </details>
 
