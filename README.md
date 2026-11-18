@@ -191,7 +191,7 @@ Only low-value lines are removed. Failures, warnings and results are never touch
 | Command family | Dropped | Always kept |
 |:--|:--|:--|
 | `dotnet build · test · restore · run` | restore chatter, `proj -> bin.dll`, per-test `Passed …` | errors, warnings, `Failed …`, the `Passed!` / `Failed!` summary |
-| `npm · pnpm · yarn · bun` install | `Progress: resolved …`, `+++` bars, lockfile notices | errors, real warnings |
+| `npm · pnpm · yarn · bun` install | `Progress: resolved …`, `+++` bars, spinner frames, deprecation notices, lockfile notices | errors, other warnings |
 | `docker build · up · pull` | `#5 DONE`, `CACHED`, layer pull progress | build errors, service logs |
 | `git clone · fetch · pull · push` | counting / compressing / receiving progress | refs, errors |
 | `cargo build · test · check · run` | one line per crate → `(37 crate steps, last: serde)` | warnings, errors, `Finished` |
@@ -228,6 +228,21 @@ tokens are estimated as bytes/4
 
 <sub>Illustrative output. Token counts are a bytes ÷ 4 estimate, not a tokenizer.</sub>
 
+#### Measured on real commands
+
+[`scripts/bench.sh`](scripts/bench.sh) runs each command twice with the state reset, once as a plain shell would (no TTY) and once through shlim, adding up every reply the agent receives until the command ends:
+
+| Command | Plain shell | With shlim | Saved |
+|:--|--:|--:|--:|
+| `dotnet build` (80 warnings) | 30,953 B | 4,175 B | **86%** |
+| `dotnet test` (60 tests) | 3,461 B | 659 B | **80%** |
+| `npm install` | 1,634 B | 81 B | **95%** |
+| `pnpm install` | 571 B | 408 B | **28%** |
+| `cargo build` (3 dependencies) | 571 B | 155 B | **72%** |
+| `docker build` | 5,712 B | 4,728 B | **17%** |
+
+<sub>One run each, macOS, warm package caches. The scenarios are noisy on purpose (80 repeated warnings, 60 passing tests); a clean build saves less. The npm figure includes hiding deprecation notices, which `read mode=all` brings back. Run it on your own projects: `scripts/bench.sh`.</sub>
+
 <br>
 
 ## 🔧 Configuration
@@ -239,7 +254,7 @@ tokens are estimated as bytes/4
 | `SHLIM_MAX_SESSIONS` | `64` | Maximum sessions running at once. |
 | `SHLIM_LOG_DAYS` | `7` | Delete raw logs older than this when the daemon starts. |
 
-State lives in a `0700` directory and the socket is owner-only. Each session runs with the environment of the client that started it (so Claude Code and Codex each get their own `PATH` and variables), and pagers are disabled (`PAGER=cat`) so nothing traps the agent in an interactive screen.
+State lives in a `0700` directory and the socket is owner-only. Each session runs with the environment of the client that started it (so Claude Code and Codex each get their own `PATH` and variables), pagers are disabled (`PAGER=cat`) so nothing traps the agent in an interactive screen, and Docker prints plain progress lines (`BUILDKIT_PROGRESS=plain`, `COMPOSE_PROGRESS=plain`) instead of a wide animated display. Set those variables yourself and yours win. Long runs of padding spaces are squeezed in replies; `read mode=all` stays verbatim.
 
 <details>
 <summary><b>Project layout</b></summary>

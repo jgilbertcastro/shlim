@@ -21,7 +21,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| vec![
     ),
     rule(
         r"\b(npm|pnpm|yarn|bun)\s+(install|i|add|ci|update|up)\b",
-        r"^\s*(Progress: resolved .*|\+{3,}-*|Lockfile is up to date.*|Already up[- ]to[- ]date|Done in [\d.]+m?s|Packages: [+-]\d+|npm (warn|WARN) (deprecated|EBADENGINE).*|npm notice.*|added \d+ packages?.* audited.*|[\d.]+ ?[kM]?B/s.*)$",
+        r"^\s*(Progress: resolved .*|\+{3,}-*|Lockfile is up to date.*|Already up[- ]to[- ]date|Done in [\d.]+m?s|Packages: [+-]\d+|npm (warn|WARN) (deprecated|EBADENGINE).*|npm notice.*|added \d+ packages?.* audited.*|[\d.]+ ?[kM]?B/s.*|[\x{2800}-\x{28FF}]+|[|/\\-])$",
     ),
     rule(
         r"\bdocker(\s+compose|-compose)?\s+(build|up|pull|buildx)\b",
@@ -169,6 +169,13 @@ mod tests {
         assert_eq!(out, ["(3 crate steps, last: c)", "warning: unused", "    Finished dev in 1s"]);
         assert_eq!(idx, [5, 8, 9]);
         assert_eq!(dropped, 3);
+    }
+    #[test]
+    fn spinner_frames_are_dropped_but_dash_rules_stay() {
+        let l = v(&["⠹", "added 255 packages in 1s", "⠼", "|", "-", "------", "npm error code E404"]);
+        let (out, _, dropped) = filter("npm install --no-audit", &l, 0);
+        assert_eq!(out, ["added 255 packages in 1s", "------", "npm error code E404"]);
+        assert_eq!(dropped, 4);
     }
     #[test]
     fn npm_progress_is_dropped_but_errors_stay() {
