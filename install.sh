@@ -60,7 +60,14 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 archive="shlim-$target.tar.gz"
 say "Downloading shlim ($target)..."
-fetch "$BASE/$archive" "$tmp/$archive" || die "could not download $BASE/$archive"
+if ! fetch "$BASE/$archive" "$tmp/$archive"; then
+  if [ -z "${SHLIM_BASE_URL:-}" ] && [ "$VERSION" = "latest" ]; then
+    die "could not download $BASE/$archive
+There may be no stable release yet. Pick a version from https://github.com/$REPO/releases and run:
+  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | SHLIM_VERSION=<tag> sh"
+  fi
+  die "could not download $BASE/$archive"
+fi
 fetch "$BASE/$archive.sha256" "$tmp/$archive.sha256" || die "could not download the checksum"
 
 expected="$(cut -d' ' -f1 "$tmp/$archive.sha256")"
